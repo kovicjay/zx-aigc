@@ -1,3 +1,16 @@
+"""
+应用入口与UI层
+
+职责:
+- 负责Tk UI构建、表单输入与持久化(ui_settings.json)
+- 组装依赖(app.auth / app.client / app.processing / app.runner)
+- 扫描任务并交给 ClusterRunner 并发执行
+- 保持运行日志与状态展示
+
+注意:
+- 业务能力(鉴权、客户端、处理、调度)均已拆分到 app/ 子模块，便于后续扩展
+"""
+
 import json
 import os
 import queue
@@ -10,7 +23,6 @@ import uuid
 import hashlib
 import hmac
 import base64
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext
 
@@ -26,137 +38,18 @@ except ImportError:
     def is_debug_mode():
         return os.getenv("DEBUG") == "1"
 
-# 调试模式标记
 DEBUG_MODE = is_debug_mode()
 
-
-def get_mac_address():
-    """获取本机MAC地址"""
-    mac = uuid.getnode()
-    return ':'.join(('%012X' % mac)[i:i+2] for i in range(0, 12, 2))
-
-
-def generate_token(mac_address=None, valid_days=30):
-    """基于MAC地址生成带时间限制的TOKEN
-    
-    Args:
-        mac_address: MAC地址，如果为None则使用本机MAC
-        valid_days: TOKEN有效天数，默认30天
-    
-    Returns:
-        生成的TOKEN字符串
-    """
-    if mac_address is None:
-        mac_address = get_mac_address()
-    
-    # 计算过期时间戳
-    expire_timestamp = int((datetime.now() + timedelta(days=valid_days)).timestamp())
-    
-    # 构建TOKEN数据：MAC地址 + 过期时间戳
-    # 将MAC地址中的冒号替换为其他分隔符，避免与主分隔符冲突
-    mac_clean = mac_address.replace(":", "-")
-    token_data = f"{mac_clean}:{expire_timestamp}"
-    
-    # 使用固定密钥生成HMAC签名
-    secret_key = "p-run-secret-key-2025"
-    signature = hmac.new(
-        secret_key.encode('utf-8'),
-        token_data.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    
-    # 组合数据：token_data + signature
-    full_token = f"{token_data}:{signature}"
-    
-    # Base64编码便于传输
-    encoded_token = base64.b64encode(full_token.encode('utf-8')).decode('utf-8')
-    
-    return encoded_token
-
-
-def verify_token(input_token):
-    """验证输入的TOKEN是否正确且未过期
-    
-    Args:
-        input_token: 用户输入的TOKEN
-    
-    Returns:
-        tuple: (是否有效, 错误信息)
-    """
-    try:
-        # Base64解码
-        decoded_token = base64.b64decode(input_token.encode('utf-8')).decode('utf-8')
-        
-        # 分离数据部分和签名
-        parts = decoded_token.split(':')
-        if len(parts) != 3:
-            return False, "TOKEN格式错误"
-        
-        mac_clean, expire_timestamp_str, signature = parts
-        
-        # 恢复MAC地址格式（将-替换回:）
-        mac_address = mac_clean.replace("-", ":")
-        
-        # 验证MAC地址是否匹配
-        current_mac = get_mac_address()
-        if mac_address != current_mac:
-            return False, "TOKEN不匹配当前设备"
-        
-        # 验证签名
-        token_data = f"{mac_clean}:{expire_timestamp_str}"
-        secret_key = "p-run-secret-key-2025"
-        expected_signature = hmac.new(
-            secret_key.encode('utf-8'),
-            token_data.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        
-        if not hmac.compare_digest(signature, expected_signature):
-            return False, "TOKEN签名验证失败"
-        
-        # 验证时间是否过期
-        expire_timestamp = int(expire_timestamp_str)
-        current_timestamp = int(datetime.now().timestamp())
-        
-        if current_timestamp > expire_timestamp:
-            expire_time = datetime.fromtimestamp(expire_timestamp)
-            return False, f"TOKEN已过期（过期时间: {expire_time.strftime('%Y-%m-%d %H:%M:%S')}）"
-        
-        return True, "验证成功"
-        
-    except Exception as e:
-        return False, f"TOKEN解析失败: {str(e)}"
-
-
-def get_token_info(token):
-    """获取TOKEN信息（用于调试）
-    
-    Args:
-        token: TOKEN字符串
-    
-    Returns:
-        dict: TOKEN信息
-    """
-    try:
-        decoded_token = base64.b64decode(token.encode('utf-8')).decode('utf-8')
-        parts = decoded_token.split(':')
-        if len(parts) != 3:
-            return {"error": "TOKEN格式错误"}
-        
-        mac_clean, expire_timestamp_str, signature = parts
-        
-        # 恢复MAC地址格式（将-替换回:）
-        mac_address = mac_clean.replace("-", ":")
-        expire_time = datetime.fromtimestamp(int(expire_timestamp_str))
-        
-        return {
-            "mac_address": mac_address,
-            "expire_time": expire_time.strftime('%Y-%m-%d %H:%M:%S'),
-            "is_expired": datetime.now().timestamp() > int(expire_timestamp_str),
-            "signature": signature[:16] + "..."  # 只显示前16位
-        }
-    except Exception as e:
-        return {"error": str(e)}
+# 引入鉴权模块（函数与对话框）
+from app.auth import (
+    get_mac_address,
+    generate_token,
+    verify_token,
+    get_token_info,
+    save_token_to_file,
+    load_token_from_file,
+    TokenDialog,
+)
 
 
 def save_token_to_file(token):
@@ -209,183 +102,10 @@ def load_token_from_file():
         return None
 
 
-@dataclass
-class TaskItem:
-    project_name: str
-    episode_name: str
-    role_name: str
-    image_path: str
-    lora_name: str
-    role_prompt: str
-
-
-class ComfyClient:
-    def __init__(self, base_url: str, logger):
-        if base_url.endswith("/"):
-            base_url = base_url[:-1]
-        self.base_url = base_url
-        self.logger = logger
-        # 统一请求头（包含 User-Agent）
-        self.default_headers = {
-            "User-Agent": "p-run/1.0 (+ComfyUI client)"
-        }
-
-    def _fix_paths_in_payload(self, obj):
-        """递归处理payload中的所有路径字段，将双斜杠转换为单反斜杠"""
-        if isinstance(obj, dict):
-            result = {}
-            for key, value in obj.items():
-                if isinstance(value, str) and self._is_path_field(key, value):
-                    # 处理路径字段：将双斜杠转换为单反斜杠
-                    # 先处理双正斜杠，再处理双反斜杠
-                    fixed_value = value.replace("//", "\\").replace("/", "\\").replace("\\\\", "\\")
-                    result[key] = fixed_value
-                else:
-                    result[key] = self._fix_paths_in_payload(value)
-            return result
-        elif isinstance(obj, list):
-            return [self._fix_paths_in_payload(item) for item in obj]
-        else:
-            return obj
-
-    def _is_path_field(self, key, value):
-        """判断字段是否可能包含路径"""
-        # 常见的路径字段名
-        path_keys = {
-            'ckpt_name', 'lora_name', 'image', 'filename', 'path', 'file_path',
-            'input_path', 'output_path', 'model_path', 'vae_path', 'control_net_name'
-        }
-        
-        # 检查字段名是否包含路径相关关键词
-        if any(path_key in key.lower() for path_key in path_keys):
-            return True
-            
-        # 检查值是否看起来像路径（包含斜杠和文件扩展名）
-        if isinstance(value, str) and ("/" in value or "\\" in value):
-            # 检查是否包含文件扩展名
-            common_extensions = {'.safetensors', '.ckpt', '.pth', '.bin', '.png', '.jpg', '.jpeg', '.webp'}
-            if any(value.lower().endswith(ext) for ext in common_extensions):
-                return True
-                
-        return False
-
-    def submit_workflow(self, workflow_json_text: str) -> str:
-        try:
-            payload = json.loads(workflow_json_text)
-        except Exception as exc:
-            raise ValueError(f"工作流JSON解析失败: {exc}")
-        # 兼容两种输入：
-        # 1) 直接是ComfyUI图（各节点字典）=> 需要包裹到{"prompt": graph}
-        # 2) 已经是{"prompt": graph, ...} => 直接提交
-        if not isinstance(payload, dict):
-            raise ValueError("工作流JSON格式错误：顶层需为对象")
-        if "prompt" not in payload:
-            payload = {"prompt": payload}
-        
-        # 处理所有路径字段，将双斜杠转换为单斜杠
-        payload = self._fix_paths_in_payload(payload)
-        # 增加client_id，便于服务端区分
-        payload.setdefault("client_id", f"p-run-{int(time.time()*1000)}")
-
-        url = f"{self.base_url}/prompt"
-        # 优先使用raw body以兼容部分反向代理/实现差异；失败回退到requests的json参数
-        try:
-            headers = {"Content-Type": "application/json"}
-            headers.update(self.default_headers)
-            # 从配置文件获取请求超时时间
-            try:
-                from load_config import get_request_timeout
-                timeout = get_request_timeout()
-            except ImportError:
-                timeout = 60
-                
-            resp = requests.post(url, data=json.dumps(payload, ensure_ascii=False), headers=headers, timeout=timeout)
-            if resp.status_code in (400, 415) or (not resp.ok):
-                # 某些实现只接受json参数或返回奇异错误，进行一次回退重试
-                self.logger(f"提交raw失败(HTTP {resp.status_code})，尝试回退json方式...")
-                resp = requests.post(url, json=payload, headers=self.default_headers, timeout=timeout)
-        except Exception as exc:
-            raise RuntimeError(f"连接ComfyUI失败: {exc}")
-        if not resp.ok:
-            # 返回更详细的错误内容，帮助定位
-            text = None
-            try:
-                text = resp.text
-            except Exception:
-                text = "<无响应文本>"
-            raise RuntimeError(f"提交工作流失败 HTTP {resp.status_code}: {text}")
-        try:
-            data = resp.json()
-        except Exception as exc:
-            raise RuntimeError(f"解析ComfyUI响应失败: {exc}; 原始文本: {resp.text[:500]}")
-        prompt_id = data.get("prompt_id") or data.get("promptId")
-        if not prompt_id:
-            raise RuntimeError(f"提交工作流失败，未返回prompt_id: {data}")
-        return prompt_id
-
-    def wait_until_done(self, prompt_id: str, poll_interval_sec: float = 1.0, timeout_sec: int = 1800) -> dict:
-        url = f"{self.base_url}/history/{prompt_id}"
-        deadline = time.time() + timeout_sec
-        last_err = None
-        next_log_ts = time.time()  # 心跳日志节流
-        while time.time() < deadline:
-            try:
-                resp = requests.get(url, headers=self.default_headers, timeout=15)
-                if resp.status_code == 404:
-                    # 可能尚未入队，稍等
-                    time.sleep(poll_interval_sec)
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                # 兼容历史接口：有些实现把结果包在 {prompt_id: {...}} 里
-                if isinstance(data, dict) and prompt_id in data and isinstance(data[prompt_id], dict):
-                    data = data[prompt_id]
-
-                # ComfyUI返回的结构通常含有"status"或包含输出
-                status = None
-                if isinstance(data, dict):
-                    # 可能的形式一：status 为字符串
-                    status = data.get("status") or data.get("state")
-
-                    # 可能的形式二：status 为对象，包含 completed/status_str
-                    status_obj = data.get("status") if isinstance(data.get("status"), dict) else None
-                    if status_obj:
-                        if status_obj.get("completed") is True:
-                            self.logger(f"运行完成: prompt {prompt_id} status=success")
-                            return data
-                        status_str = status_obj.get("status_str")
-                        if isinstance(status_str, str) and status_str.lower() in {"completed", "success", "done"}:
-                            self.logger(f"运行完成: prompt {prompt_id} status={status_str}")
-                            return data
-
-                    # 如果包含outputs则认为完成
-                    outputs = data.get("outputs") or data.get("output")
-                    if outputs:
-                        self.logger(f"运行完成: prompt {prompt_id} outputs_ready=true")
-                        return data
-
-                    # 周期性心跳日志，避免用户误以为卡死
-                    now = time.time()
-                    if now >= next_log_ts:
-                        status_for_log = None
-                        if status_obj and isinstance(status_obj.get("status_str"), str):
-                            status_for_log = status_obj.get("status_str")
-                        elif isinstance(status, str):
-                            status_for_log = status
-                        self.logger(f"运行中: prompt {prompt_id} status={status_for_log or 'pending'}")
-                        next_log_ts = now + 5
-
-                    # 检测错误状态
-                    if (isinstance(status, str) and status.lower() in {"error", "failed"}) or data.get("error") or data.get("node_errors"):
-                        raise RuntimeError(f"ComfyUI执行错误: {str(data)[:500]}")
-
-                if isinstance(status, str) and status.lower() in {"completed", "success", "done"}:
-                    self.logger(f"运行完成: prompt {prompt_id} status={status}")
-                    return data
-            except Exception as exc:
-                last_err = exc
-            time.sleep(poll_interval_sec)
-        raise TimeoutError(f"等待工作流完成超时: {last_err}")
+from app.models import TaskItem
+from app.client import ComfyClient
+from app.processing import ProcessingService
+from app.runner import ClusterRunner
 
 
 class TokenDialog:
@@ -874,11 +594,9 @@ class App:
         self.is_running = False
         self.worker_thread = None
         self.log_queue = queue.Queue()
-        # 集群/并发相关
-        self.task_queue: queue.Queue | None = None
-        self.worker_threads: list[threading.Thread] = []
+        # 集群/并发相关（由runner接管）
+        self.runner: ClusterRunner | None = None
         self.stop_event = threading.Event()
-        self.enqueued_paths: set[str] = set()
         self.current_token = None  # 存储当前使用的TOKEN
         self.token_check_timer = None  # TOKEN检查定时器
         self.last_model_name = None  # 记录上次使用的大模型名称
@@ -1220,34 +938,36 @@ class App:
             self.is_running = True
             self.btn_run.config(text="停止")
             self.stop_event.clear()
-            self.task_queue = queue.Queue()
-            self.enqueued_paths.clear()
-            # 启动扫描线程
+            # 启动runner
+            self.processing = ProcessingService(
+                prepare_workflow_text=lambda t: self._prepare_workflow_text(t),
+                log_func=self._log,
+                append_run_log_file=self._append_run_log_file,
+            )
+            self.runner = ClusterRunner(self._log)
+            self.runner.set_process_func(lambda task, client: self.processing.process(task, client))
+            self.runner.start(nodes, node_interval)
+            # 启动扫描线程（仅负责扫描并入队）
             self.worker_thread = threading.Thread(target=self._run_loop, daemon=True)
             self.worker_thread.start()
-            # 为每个节点启动一个工作线程
-            self.worker_threads = []
-            for node_url in nodes:
-                t = threading.Thread(target=self._node_worker, args=(node_url, node_interval), daemon=True)
-                t.start()
-                self.worker_threads.append(t)
             self._log(f"开始执行循环... 已启动 {len(nodes)} 个节点工作线程，间隔 {node_interval}s")
         else:
             self.is_running = False
             self.btn_run.config(text="执行")
             self._log("请求停止，完成当前任务后退出...")
             self.stop_event.set()
-            # 等待工作线程结束
+            # 停止runner
+            try:
+                if self.runner:
+                    self.runner.stop()
+            except Exception:
+                pass
+            # 等待扫描线程结束
             try:
                 if self.worker_thread:
                     self.worker_thread.join(timeout=1.0)
             except Exception:
                 pass
-            for t in self.worker_threads:
-                try:
-                    t.join(timeout=1.0)
-                except Exception:
-                    pass
 
     def _drain_logs_periodically(self):
         try:
@@ -1272,64 +992,23 @@ class App:
     def _run_loop(self):
         base_dir = self.entry_dir.get().strip()
         sleep_sec = int(self.entry_sleep.get().strip())
-
         while self.is_running and not self.stop_event.is_set():
             tasks = self._scan_directory_for_tasks(base_dir)
-            new_count = 0
-            for task in tasks:
-                if self.stop_event.is_set():
-                    break
-                # 去重：避免重复入队相同图片
-                if task.image_path in self.enqueued_paths:
-                    continue
+            enq = 0
+            if self.runner:
                 try:
-                    self.task_queue.put_nowait(task)
-                    self.enqueued_paths.add(task.image_path)
-                    new_count += 1
-                except Exception:
-                    pass
-
-            if new_count > 0:
-                self._log(f"扫描到 {new_count} 个新任务，已入队，等待节点处理...")
+                    enq = self.runner.enqueue_tasks(tasks)
+                except Exception as exc:
+                    self._log(f"入队失败: {exc}")
+            if enq > 0:
+                self._log(f"扫描到 {enq} 个新任务，已入队，等待节点处理...")
             else:
                 self._log(f"未发现新的待处理图片，休眠 {sleep_sec} 秒...")
-
             for _ in range(sleep_sec):
                 if not self.is_running or self.stop_event.is_set():
                     break
                 time.sleep(1)
-
         self._log("已停止(扫描线程)。")
-
-    def _node_worker(self, node_url: str, node_interval_sec: float):
-        client = ComfyClient(node_url, self._log)
-        while self.is_running and not self.stop_event.is_set():
-            try:
-                task: TaskItem = self.task_queue.get(timeout=1.0)
-            except Exception:
-                continue
-            # 任务可能已被其他原因处理/移动，处理函数内部有存在性校验
-            try:
-                self._process_single_task(task, client)
-            except Exception as exc:
-                self._log(f"节点 {node_url} 处理失败: {task.image_path} -> {exc}")
-            finally:
-                # 从去重集合移除，允许后续重新扫描时再次入队（如果仍存在）
-                try:
-                    if task.image_path in self.enqueued_paths:
-                        self.enqueued_paths.remove(task.image_path)
-                except Exception:
-                    pass
-                try:
-                    self.task_queue.task_done()
-                except Exception:
-                    pass
-            # 每台机器的任务间隔
-            if node_interval_sec > 0:
-                for _ in range(int(max(1, node_interval_sec))):
-                    if not self.is_running or self.stop_event.is_set():
-                        break
-                    time.sleep(1)
 
     def _parse_nodes(self, raw: str) -> list[str]:
         nodes: list[str] = []
