@@ -1,0 +1,38 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE/project files
+.vscode/
+.idea/
+
+# PyInstaller / build artifacts
+build/
+dist/
+*.spec
+*.toc
+*.pyz
+*.pkg
+*.manifest
+
+# Logs
+*.log
+run.log
+
+# Local configs / runtime state
+config.env
+ui_settings.json
+saved_token.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+
